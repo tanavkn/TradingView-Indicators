@@ -1,0 +1,513 @@
+//@version=6
+
+// ═════════════════════════════════════════════════════════════════════════════════════
+//  Recent SMT — per-timeframe recency windows
+//
+//  Scans only the most recent X candles of each timeframe, where X is set independently
+//  per timeframe. Nothing older is examined and nothing older is drawn. The window is
+//  rolling: it moves with the current bar, so a mark disappears by itself once its candle
+//  falls out of the window.
+//
+//  ARCHITECTURE. The window is defined relative to NOW, not relative to each historical
+//  bar, so the script does no detection and no drawing on historical bars at all. On every
+//  bar it only maintains small rolling buffers of each timeframe's recent candles; at the
+//  live edge it wipes every drawing and rebuilds from those buffers. That is what keeps
+//  the drawing count trivially small, makes stale signals structurally impossible, and
+//  removes the need for any cleanup, cooldown or cap logic.
+//
+//  DETECTION RULES, unchanged in spirit:
+//    - No pivot confirmation. No ta.pivothigh / ta.pivotlow, nothing waits for bars to the
+//      right of a candle.
+//    - No minimum divergence size. Strict > and < only, so a one-tick wick mismatch counts.
+//    - No lookahead. Every request.security() call uses barmerge.lookahead_off.
+// ═════════════════════════════════════════════════════════════════════════════════════
+
+indicator(
+     title            = "Recent SMT",
+     shorttitle       = "SMT",
+     overlay          = true,
+     max_labels_count = 500,
+     max_lines_count  = 500)
+
+// ── Constants ───────────────────────────────────────────────────────────────────────
+SYM_SLOTS       = 3        // comparison-symbol slots (timeframe slots are fixed at four)
+MAX_SCAN        = 50       // ceiling on a timeframe's scan window
+LABEL_PAD_TICKS = 12       // label offset from the candle, in mintick units, per stack row
+TRANSPARENT     = 100      // full transparency, for the label's unused background
+MS_PER_SEC      = 1000
+SEC_MIN         = 60
+SEC_HOUR        = 3600
+SEC_DAY         = 86400
+SEC_WEEK        = 604800
+
+MODE_RUNNING  = "Running extreme"
+MODE_ADJACENT = "Adjacent candles"
+
+GRP_TF1     = "Timeframe 1"
+GRP_TF2     = "Timeframe 2"
+GRP_TF3     = "Timeframe 3"
+GRP_TF4     = "Timeframe 4"
+GRP_SYMBOLS = "Comparison symbols"
+GRP_MODE    = "Detection mode"
+GRP_DISPLAY = "Display"
+GRP_ALERTS  = "Alerts"
+
+// ── Types ───────────────────────────────────────────────────────────────────────────
+
+// One comparison symbol's recent candles on one timeframe.
+type PeerBuf
+    array<float> hi
+    array<float> lo
+
+// One timeframe slot's rolling buffers. `t`, `cHi` and `cLo` are the chart symbol's recent
+// candles; `peers` holds the same window for each comparison symbol, index-aligned with
+// them because every symbol is pushed on the same transition.
+type TfBuf
+    array<int>     t
+    array<float>   cHi
+    array<float>   cLo
+    array<PeerBuf> peers
+    int            lastT = na
+
+// ── Inputs · Timeframe slots ────────────────────────────────────────────────────────
+// Each slot scans its own window, independently of the others: changing the 15m window
+// has no effect on the 5m. Minimum window is 2 because a divergence needs two candles to
+// compare.
+useTF1  = input.bool(true, "Enable", group = GRP_TF1)
+tf1     = input.timeframe("5", "Timeframe", group = GRP_TF1)
+scanTF1 = input.int(5, "Candles to scan", minval = 2, maxval = MAX_SCAN, group = GRP_TF1,
+     tooltip = "Only this many of the most recent candles on this timeframe are scanned. Anything older is never examined and never drawn.")
+
+useTF2  = input.bool(true, "Enable", group = GRP_TF2)
+tf2     = input.timeframe("15", "Timeframe", group = GRP_TF2)
+scanTF2 = input.int(3, "Candles to scan", minval = 2, maxval = MAX_SCAN, group = GRP_TF2)
+
+useTF3  = input.bool(false, "Enable", group = GRP_TF3)
+tf3     = input.timeframe("30", "Timeframe", group = GRP_TF3)
+scanTF3 = input.int(3, "Candles to scan", minval = 2, maxval = MAX_SCAN, group = GRP_TF3)
+
+useTF4  = input.bool(false, "Enable", group = GRP_TF4)
+tf4     = input.timeframe("60", "Timeframe", group = GRP_TF4)
+scanTF4 = input.int(2, "Candles to scan", minval = 2, maxval = MAX_SCAN, group = GRP_TF4)
+
+// ── Inputs · Comparison symbols ─────────────────────────────────────────────────────
+// Fetched unconditionally below; the checkbox only gates evaluation, never the
+// request.security() call itself.
+use1 = input.bool(true, "Slot 1", inline = "slot1", group = GRP_SYMBOLS)
+sym1 = input.symbol("CME_MINI:ES1!", "", inline = "slot1", group = GRP_SYMBOLS)
+use2 = input.bool(true, "Slot 2", inline = "slot2", group = GRP_SYMBOLS)
+sym2 = input.symbol("CME_MINI:NQ1!", "", inline = "slot2", group = GRP_SYMBOLS)
+use3 = input.bool(true, "Slot 3", inline = "slot3", group = GRP_SYMBOLS)
+sym3 = input.symbol("CBOT_MINI:YM1!", "", inline = "slot3", group = GRP_SYMBOLS)
+
+// ── Inputs · Detection mode ─────────────────────────────────────────────────────────
+compareMode = input.string(MODE_RUNNING, "Compare each candle against", options = [MODE_RUNNING, MODE_ADJACENT], group = GRP_MODE,
+     tooltip = "Running extreme: each candle's high is measured against the highest high of the earlier candles in the window (mirrored for lows). The classic SMT read, bounded to the window. Adjacent candles: each candle is measured only against the one immediately before it, marking every disagreement over which candle made the higher high or lower low.")
+
+// ── Inputs · Display ────────────────────────────────────────────────────────────────
+bearColor  = input.color(#ef5350, "Bearish", inline = "colors", group = GRP_DISPLAY)
+bullColor  = input.color(#26a69a, "Bullish", inline = "colors", group = GRP_DISPLAY)
+lineWidth  = input.int(1, "Line width", minval = 1, maxval = 4, group = GRP_DISPLAY)
+showLabels = input.bool(true, "Show text label", group = GRP_DISPLAY)
+debugMode  = input.bool(false, "Debug table", group = GRP_DISPLAY,
+     tooltip = "Shows one row per enabled timeframe slot: its resolved timeframe, window size, position relative to the chart timeframe, how many candles are buffered, and how many signals it is currently drawing.")
+
+// ── Inputs · Alerts ─────────────────────────────────────────────────────────────────
+alertOn = input.bool(true, "Fire alert() on a new SMT", group = GRP_ALERTS,
+     tooltip = "Fires when a divergence forms on the NEWEST candle of a window, not merely because one is still sitting inside the window.")
+
+// ── Timeframe classification ────────────────────────────────────────────────────────
+chartSecs = timeframe.in_seconds(timeframe.period)
+tfSecs1 = timeframe.in_seconds(tf1)
+tfSecs2 = timeframe.in_seconds(tf2)
+tfSecs3 = timeframe.in_seconds(tf3)
+tfSecs4 = timeframe.in_seconds(tf4)
+
+// ── Naming helpers ──────────────────────────────────────────────────────────────────
+
+// "CME_MINI:ES1!" -> "ES1!".
+shortName(string symbolId) =>
+    parts = str.split(symbolId, ":")
+    array.get(parts, array.size(parts) - 1)
+
+// Clean human-readable timeframe: "5" -> "5m", "60" -> "1h", "240" -> "4h", "1D" -> "1D".
+// Derived from the resolved seconds, so the picker's internal notation never reaches a label.
+tfLabelOf(simple string tf) =>
+    secs = timeframe.in_seconds(tf)
+    switch
+        str.endswith(tf, "M") => tf
+        secs < SEC_MIN        => str.tostring(secs) + "s"
+        secs < SEC_HOUR       => str.tostring(secs / SEC_MIN) + "m"
+        secs < SEC_DAY        => str.tostring(secs / SEC_HOUR) + "h"
+        secs % SEC_WEEK == 0  => str.tostring(secs / SEC_WEEK) + "W"
+        => str.tostring(secs / SEC_DAY) + "D"
+
+// Inputs cannot change mid-run, so resolve these once on bar 0. Each slot gets its OWN
+// label string here; the debug table prints them back so a mis-tagged label is immediately
+// visible rather than something to guess at.
+var string name1 = shortName(sym1)
+var string name2 = shortName(sym2)
+var string name3 = shortName(sym3)
+var array<string> slotNames = array.from(name1, name2, name3)
+var string tfName1 = tfLabelOf(tf1)
+var string tfName2 = tfLabelOf(tf2)
+var string tfName3 = tfLabelOf(tf3)
+var string tfName4 = tfLabelOf(tf4)
+
+// A slot aimed at the chart symbol is skipped silently — no self-comparison, no error.
+var bool self1 = sym1 == syminfo.tickerid or name1 == syminfo.ticker
+var bool self2 = sym2 == syminfo.tickerid or name2 == syminfo.ticker
+var bool self3 = sym3 == syminfo.tickerid or name3 == syminfo.ticker
+symEnabled = array.from(use1 and not self1, use2 and not self2, use3 and not self3)
+
+// ── Timeframe data ──────────────────────────────────────────────────────────────────
+// Sixteen explicit request.security() calls: four for the chart symbol (one per timeframe)
+// and twelve for the symbol x timeframe grid. The symbol and timeframe arguments must be
+// simple values and cannot be looped over, so every combination is written out. Sixteen is
+// comfortably under Pine's 40-call ceiling and no combination has been dropped.
+//
+// Only raw high/low/time is fetched. Nothing is computed inside the request: the running
+// extremes are derived from the rolling buffers below, which is what removes every
+// max_bars_back and dynamic-index concern from this script.
+[c1H, c1L, c1T] = request.security(syminfo.tickerid, tf1, [high, low, time], lookahead = barmerge.lookahead_off, gaps = barmerge.gaps_off)
+[c2H, c2L, c2T] = request.security(syminfo.tickerid, tf2, [high, low, time], lookahead = barmerge.lookahead_off, gaps = barmerge.gaps_off)
+[c3H, c3L, c3T] = request.security(syminfo.tickerid, tf3, [high, low, time], lookahead = barmerge.lookahead_off, gaps = barmerge.gaps_off)
+[c4H, c4L, c4T] = request.security(syminfo.tickerid, tf4, [high, low, time], lookahead = barmerge.lookahead_off, gaps = barmerge.gaps_off)
+
+[p11H, p11L] = request.security(sym1, tf1, [high, low], lookahead = barmerge.lookahead_off, gaps = barmerge.gaps_off)
+[p21H, p21L] = request.security(sym2, tf1, [high, low], lookahead = barmerge.lookahead_off, gaps = barmerge.gaps_off)
+[p31H, p31L] = request.security(sym3, tf1, [high, low], lookahead = barmerge.lookahead_off, gaps = barmerge.gaps_off)
+
+[p12H, p12L] = request.security(sym1, tf2, [high, low], lookahead = barmerge.lookahead_off, gaps = barmerge.gaps_off)
+[p22H, p22L] = request.security(sym2, tf2, [high, low], lookahead = barmerge.lookahead_off, gaps = barmerge.gaps_off)
+[p32H, p32L] = request.security(sym3, tf2, [high, low], lookahead = barmerge.lookahead_off, gaps = barmerge.gaps_off)
+
+[p13H, p13L] = request.security(sym1, tf3, [high, low], lookahead = barmerge.lookahead_off, gaps = barmerge.gaps_off)
+[p23H, p23L] = request.security(sym2, tf3, [high, low], lookahead = barmerge.lookahead_off, gaps = barmerge.gaps_off)
+[p33H, p33L] = request.security(sym3, tf3, [high, low], lookahead = barmerge.lookahead_off, gaps = barmerge.gaps_off)
+
+[p14H, p14L] = request.security(sym1, tf4, [high, low], lookahead = barmerge.lookahead_off, gaps = barmerge.gaps_off)
+[p24H, p24L] = request.security(sym2, tf4, [high, low], lookahead = barmerge.lookahead_off, gaps = barmerge.gaps_off)
+[p34H, p34L] = request.security(sym3, tf4, [high, low], lookahead = barmerge.lookahead_off, gaps = barmerge.gaps_off)
+
+// ── Rolling buffers ─────────────────────────────────────────────────────────────────
+newPeerBuf() =>
+    PeerBuf.new(hi = array.new<float>(), lo = array.new<float>())
+
+newTfBuf() =>
+    TfBuf.new(t = array.new<int>(), cHi = array.new<float>(), cLo = array.new<float>(), peers = array.from(newPeerBuf(), newPeerBuf(), newPeerBuf()))
+
+var array<TfBuf> bufs = array.from(newTfBuf(), newTfBuf(), newTfBuf(), newTfBuf())
+
+// Maintain one slot's buffers. This is the only work done on historical bars, and it
+// creates no drawings.
+//
+// A new candle on the target timeframe has opened when the returned `time` changes; until
+// then the newest slot is updated in place, so a forming candle's running high/low stays
+// current without ever adding a duplicate entry. The buffer is then trimmed from the front
+// so it never holds more than the window that will be scanned.
+//
+// The push/update split also makes this correct under Pine's realtime rollback, whether or
+// not array mutations are rolled back: if they are, the tick re-pushes into a rolled-back
+// buffer; if they are not, `lastT` already matches and the update branch runs instead.
+// Returns the number of candles the buffer now holds, which the debug table reports.
+pushSlot(TfBuf b, int t, float cH, float cL, array<float> pHi, array<float> pLo, int cap) =>
+    if not na(t)
+        if na(b.lastT) or b.lastT != t
+            b.lastT := t
+            array.push(b.t, t)
+            array.push(b.cHi, cH)
+            array.push(b.cLo, cL)
+            for j = 0 to SYM_SLOTS - 1
+                p = array.get(b.peers, j)
+                array.push(p.hi, array.get(pHi, j))
+                array.push(p.lo, array.get(pLo, j))
+        else
+            last = array.size(b.t) - 1
+            if last >= 0
+                array.set(b.cHi, last, cH)
+                array.set(b.cLo, last, cL)
+                for j = 0 to SYM_SLOTS - 1
+                    p = array.get(b.peers, j)
+                    array.set(p.hi, last, array.get(pHi, j))
+                    array.set(p.lo, last, array.get(pLo, j))
+
+    // Trim from the front so the buffer never holds more than the window to be scanned.
+    //
+    // This sits OUTSIDE the if/else above on purpose. array.shift() RETURNS the element it
+    // removes, so a branch ending on it types as `series float` while the other branch,
+    // ending on array.set(), types as `void` — and Pine refuses to give an if/else two
+    // incompatible branch types (CE10235). Out here both branches end on a void
+    // array.push() / array.set() instead, and the trim runs on every call regardless.
+    while array.size(b.t) > cap
+        array.shift(b.t)
+        array.shift(b.cHi)
+        array.shift(b.cLo)
+        for j = 0 to SYM_SLOTS - 1
+            p = array.get(b.peers, j)
+            array.shift(p.hi)
+            array.shift(p.lo)
+
+    // Explicit trailing value, so the function's return type is a plain int rather than
+    // whatever the last block happened to evaluate to.
+    array.size(b.t)
+
+buf1 = pushSlot(array.get(bufs, 0), c1T, c1H, c1L, array.from(p11H, p21H, p31H), array.from(p11L, p21L, p31L), scanTF1)
+buf2 = pushSlot(array.get(bufs, 1), c2T, c2H, c2L, array.from(p12H, p22H, p32H), array.from(p12L, p22L, p32L), scanTF2)
+buf3 = pushSlot(array.get(bufs, 2), c3T, c3H, c3L, array.from(p13H, p23H, p33H), array.from(p13L, p23L, p33L), scanTF3)
+buf4 = pushSlot(array.get(bufs, 3), c4T, c4H, c4L, array.from(p14H, p24H, p34H), array.from(p14L, p24L, p34L), scanTF4)
+
+// ── Below-chart trust gate ──────────────────────────────────────────────────────────
+// A timeframe LOWER than the chart's is a special case. On historical bars a below-chart
+// request.security() surfaces only one value per CHART bar — the last sub-candle of each
+// chart bar — so the buffer starts out undersampled and would silently describe candles
+// that never existed. In realtime it does update at every genuine sub-candle boundary, so
+// the buffer refills correctly as the script runs.
+//
+// This check is what keeps that from misleading: a below-chart slot only draws once every
+// adjacent pair in its window is exactly one timeframe apart, i.e. once live running has
+// replaced the undersampled history with real consecutive candles. Until then the slot
+// draws nothing and the debug table reports it as warming. A session break resets it for
+// one window's worth of candles, which is the safe direction to fail in.
+bufferSpaced(TfBuf b, int window, int tfSecs) =>
+    n = array.size(b.t)
+    ok = n >= 2
+    if ok
+        w = n < window ? n : window
+        start = n - w
+        for i = start + 1 to n - 1
+            if array.get(b.t, i) - array.get(b.t, i - 1) != tfSecs * MS_PER_SEC
+                ok := false
+                break
+    ok
+
+trust1 = tfSecs1 >= chartSecs or bufferSpaced(array.get(bufs, 0), scanTF1, tfSecs1)
+trust2 = tfSecs2 >= chartSecs or bufferSpaced(array.get(bufs, 1), scanTF2, tfSecs2)
+trust3 = tfSecs3 >= chartSecs or bufferSpaced(array.get(bufs, 2), scanTF3, tfSecs3)
+trust4 = tfSecs4 >= chartSecs or bufferSpaced(array.get(bufs, 3), scanTF4, tfSecs4)
+
+// Stack rank: 0 for the lowest enabled timeframe, so its labels sit closest to the candle
+// and higher timeframes stack outwards. Computed from resolved seconds, so entering the
+// timeframes out of order still stacks correctly.
+tfLive  = array.from(useTF1, useTF2, useTF3, useTF4)
+tfSecsA = array.from(tfSecs1, tfSecs2, tfSecs3, tfSecs4)
+
+stackRank(array<bool> live, array<int> secs, int idx) =>
+    rank = 0
+    mine = array.get(secs, idx)
+    for i = 0 to array.size(live) - 1
+        if i != idx and array.get(live, i)
+            other = array.get(secs, i)
+            if other < mine or (other == mine and i < idx)
+                rank += 1
+    rank
+
+// ── Drawings ────────────────────────────────────────────────────────────────────────
+// Every drawing this script has on the chart is registered here. At the live edge the
+// whole set is deleted and rebuilt, so nothing accumulates anywhere and a candle rolling
+// out of its window loses its mark on the next rebuild with no cleanup logic of any kind.
+var array<line>  liveLines  = array.new<line>()
+var array<label> liveLabels = array.new<label>()
+
+wipeDrawings() =>
+    if array.size(liveLines) > 0
+        for i = 0 to array.size(liveLines) - 1
+            line.delete(array.get(liveLines, i))
+        array.clear(liveLines)
+    if array.size(liveLabels) > 0
+        for i = 0 to array.size(liveLabels) - 1
+            label.delete(array.get(liveLabels, i))
+        array.clear(liveLabels)
+
+// One tooltip line: direction, which symbol made the extreme, which failed, the timeframe
+// and the window size.
+tipLine(bool isBear, bool chartLed, string otherName, string tfLabel, int window) =>
+    leader = chartLed ? syminfo.ticker : otherName
+    failed = chartLed ? otherName : syminfo.ticker
+    (isBear ? "Bearish SMT — " : "Bullish SMT — ") + leader + (isBear ? " made the high, " : " made the low, ") + failed + " did not (" + tfLabel + ", last " + str.tostring(window) + " candles)"
+
+// Draw one divergence: a dashed connector from the earlier candle of the pair to the later
+// one in chart-symbol price space, plus its label at the right-hand end. Positioned by
+// TIMESTAMP throughout, which is what makes a 1h mark land correctly on a 5m chart.
+// Returns 1, so the caller's tally is a sum of what was actually drawn and this function's
+// return type is a plain int rather than whatever its last block evaluates to.
+emit(bool isBear, int t1, float y1, int t2, float y2, string names, string tips, string tfLabel, float pad) =>
+    col = isBear ? bearColor : bullColor
+    ln = line.new(t1, y1, t2, y2, xloc = xloc.bar_time, color = col, style = line.style_dashed, width = lineWidth)
+    array.push(liveLines, ln)
+    if showLabels
+        ly = isBear ? y2 + pad : y2 - pad
+        tip = tips + "\n" + str.format_time(t2, "yyyy-MM-dd HH:mm", syminfo.timezone)
+        lb = label.new(t2, ly, text = names + " · " + tfLabel, tooltip = tip, xloc = xloc.bar_time, yloc = yloc.price, style = label.style_none, color = color.new(color.black, TRANSPARENT), textcolor = col, size = size.small, textalign = text.align_center)
+        array.push(liveLabels, lb)
+    1
+
+// ── Window scan ─────────────────────────────────────────────────────────────────────
+// Scans one timeframe slot's recency window and draws everything inside it.
+// Returns [signals, bearOnNewest, bullOnNewest] — the count for the debug table, and
+// whether the divergence landed on the newest candle, which is what the alerts key off.
+scanSlot(int slotIdx, bool enabled, string tfLabel, int window, float pad) =>
+    b = array.get(bufs, slotIdx)
+    signals = 0
+    bearNew = false
+    bullNew = false
+    n = array.size(b.t)
+
+    if barstate.islast and enabled and n >= 2
+        // The window is the last `window` buffered candles — never more, and never a bar
+        // older than that. The buffer is trimmed to the same size on push, so `start` is
+        // normally 0; the min() only matters before the buffer has filled.
+        w = n < window ? n : window
+        start = n - w
+        useRunning = compareMode == MODE_RUNNING
+
+        // Running extremes over the EARLIER candles of the window, advanced as i moves.
+        // Only consulted in "Running extreme" mode.
+        runHi = array.get(b.cHi, start)
+        runLo = array.get(b.cLo, start)
+        runHiIdx = start
+        runLoIdx = start
+        runHiX = array.new<float>(SYM_SLOTS)
+        runLoX = array.new<float>(SYM_SLOTS)
+        for j = 0 to SYM_SLOTS - 1
+            p = array.get(b.peers, j)
+            array.set(runHiX, j, array.get(p.hi, start))
+            array.set(runLoX, j, array.get(p.lo, start))
+
+        // The first candle of the window has nothing earlier to be measured against, so
+        // testing starts at start + 1. A window of 2 therefore yields one comparison.
+        for i = start + 1 to n - 1
+            cH = array.get(b.cHi, i)
+            cL = array.get(b.cLo, i)
+            tI = array.get(b.t, i)
+            // What this candle is measured against, per mode.
+            refHi    = useRunning ? runHi : array.get(b.cHi, i - 1)
+            refLo    = useRunning ? runLo : array.get(b.cLo, i - 1)
+            refHiIdx = useRunning ? runHiIdx : i - 1
+            refLoIdx = useRunning ? runLoIdx : i - 1
+
+            bearNames = ""
+            bearTips  = ""
+            bullNames = ""
+            bullTips  = ""
+            for j = 0 to SYM_SLOTS - 1
+                if array.get(symEnabled, j)
+                    p = array.get(b.peers, j)
+                    xH = array.get(p.hi, i)
+                    xL = array.get(p.lo, i)
+                    xRefHi = useRunning ? array.get(runHiX, j) : array.get(p.hi, i - 1)
+                    xRefLo = useRunning ? array.get(runLoX, j) : array.get(p.lo, i - 1)
+                    // A comparison symbol with no candle here (holiday, different session
+                    // hours, illiquid globex bar) yields na and simply produces no signal.
+                    okHi = not na(cH) and not na(refHi) and not na(xH) and not na(xRefHi)
+                    okLo = not na(cL) and not na(refLo) and not na(xL) and not na(xRefLo)
+                    // Strict > and <, so one tick past the reference is a break and a
+                    // wick-only mismatch counts. Exactly one of the two symbols breaking
+                    // is the divergence — which is what the inequality between the two
+                    // break flags says, symmetrically, without caring which side failed.
+                    cUp = okHi and cH > refHi
+                    xUp = okHi and xH > xRefHi
+                    cDn = okLo and cL < refLo
+                    xDn = okLo and xL < xRefLo
+                    nm = array.get(slotNames, j)
+                    if okHi and cUp != xUp
+                        bearNames := bearNames + (bearNames == "" ? "" : ", ") + nm
+                        bearTips := bearTips + (bearTips == "" ? "" : "\n") + tipLine(true, cUp, nm, tfLabel, window)
+                    if okLo and cDn != xDn
+                        bullNames := bullNames + (bullNames == "" ? "" : ", ") + nm
+                        bullTips := bullTips + (bullTips == "" ? "" : "\n") + tipLine(false, cDn, nm, tfLabel, window)
+
+            // Several symbols diverging on the same candle in the same direction share one
+            // line and one label listing them all — the connector geometry is identical
+            // because it is drawn in chart-symbol price space.
+            if bearNames != ""
+                signals += emit(true, array.get(b.t, refHiIdx), refHi, tI, cH, bearNames, bearTips, tfLabel, pad)
+                bearNew := bearNew or i == n - 1
+            if bullNames != ""
+                signals += emit(false, array.get(b.t, refLoIdx), refLo, tI, cL, bullNames, bullTips, tfLabel, pad)
+                bullNew := bullNew or i == n - 1
+
+            // Advance the running extremes to include candle i, AFTER it has been tested
+            // against them. >= / <= keeps the anchor on the most recent candle when
+            // several tie for the extreme.
+            if not na(cH) and (na(runHi) or cH >= runHi)
+                runHi := cH
+                runHiIdx := i
+            if not na(cL) and (na(runLo) or cL <= runLo)
+                runLo := cL
+                runLoIdx := i
+            for j = 0 to SYM_SLOTS - 1
+                p = array.get(b.peers, j)
+                xh = array.get(p.hi, i)
+                xl = array.get(p.lo, i)
+                curHi = array.get(runHiX, j)
+                curLo = array.get(runLoX, j)
+                if not na(xh) and (na(curHi) or xh >= curHi)
+                    array.set(runHiX, j, xh)
+                if not na(xl) and (na(curLo) or xl <= curLo)
+                    array.set(runLoX, j, xl)
+
+    [signals, bearNew, bullNew]
+
+// ── Live-edge rebuild ───────────────────────────────────────────────────────────────
+// Wipe first, then rebuild. Nothing below runs on historical bars.
+if barstate.islast
+    wipeDrawings()
+
+// Label offset per stack row, scaled off the instrument's tick size so ES, NQ and YM all
+// read the same. Row 0 is the lowest enabled timeframe and sits closest to the candle.
+padUnit = syminfo.mintick * LABEL_PAD_TICKS
+rank1 = stackRank(tfLive, tfSecsA, 0)
+rank2 = stackRank(tfLive, tfSecsA, 1)
+rank3 = stackRank(tfLive, tfSecsA, 2)
+rank4 = stackRank(tfLive, tfSecsA, 3)
+
+[sig1, bear1, bull1] = scanSlot(0, useTF1 and trust1, tfName1, scanTF1, padUnit * (rank1 + 1))
+[sig2, bear2, bull2] = scanSlot(1, useTF2 and trust2, tfName2, scanTF2, padUnit * (rank2 + 1))
+[sig3, bear3, bull3] = scanSlot(2, useTF3 and trust3, tfName3, scanTF3, padUnit * (rank3 + 1))
+[sig4, bear4, bull4] = scanSlot(3, useTF4 and trust4, tfName4, scanTF4, padUnit * (rank4 + 1))
+
+// ── Debug table ─────────────────────────────────────────────────────────────────────
+// One row per enabled slot, so it is obvious at a glance which slots are actually running
+// and what timeframe each one resolved to.
+relText(int tfSecs, bool trusted) =>
+    tfSecs > chartSecs ? "above" : tfSecs == chartSecs ? "same" : (trusted ? "below" : "below · warming")
+
+var table dbg = table.new(position.top_right, 5, 5, border_width = 1, frame_width = 1)
+
+if debugMode and barstate.islast
+    table.clear(dbg, 0, 0, 4, 4)
+    dbgUse   = array.from(useTF1, useTF2, useTF3, useTF4)
+    dbgName  = array.from(tfName1, tfName2, tfName3, tfName4)
+    dbgWin   = array.from(scanTF1, scanTF2, scanTF3, scanTF4)
+    dbgRel   = array.from(relText(tfSecs1, trust1), relText(tfSecs2, trust2), relText(tfSecs3, trust3), relText(tfSecs4, trust4))
+    dbgBuf   = array.from(buf1, buf2, buf3, buf4)
+    dbgSig   = array.from(sig1, sig2, sig3, sig4)
+    headers  = array.from("TF", "window", "vs chart", "buffered", "signals")
+    for col = 0 to 4
+        table.cell(dbg, col, 0, array.get(headers, col), text_color = color.gray, text_size = size.tiny)
+    row = 1
+    for k = 0 to 3
+        if array.get(dbgUse, k)
+            table.cell(dbg, 0, row, array.get(dbgName, k), text_color = color.gray, text_size = size.tiny)
+            table.cell(dbg, 1, row, str.tostring(array.get(dbgWin, k)), text_color = color.gray, text_size = size.tiny)
+            table.cell(dbg, 2, row, array.get(dbgRel, k), text_color = color.gray, text_size = size.tiny)
+            table.cell(dbg, 3, row, str.tostring(array.get(dbgBuf, k)), text_color = color.gray, text_size = size.tiny)
+            table.cell(dbg, 4, row, str.tostring(array.get(dbgSig, k)), text_color = color.gray, text_size = size.tiny)
+            row += 1
+
+// ── Alerts ──────────────────────────────────────────────────────────────────────────
+// Keyed on a divergence forming on the NEWEST candle of a window, not on one merely still
+// sitting inside the window — otherwise every bar would re-fire for the same old mark.
+anyBear = bear1 or bear2 or bear3 or bear4
+anyBull = bull1 or bull2 or bull3 or bull4
+
+alertcondition(anyBull, title = "Bullish SMT", message = "Bullish SMT divergence on {{ticker}} ({{interval}})")
+alertcondition(anyBear, title = "Bearish SMT", message = "Bearish SMT divergence on {{ticker}} ({{interval}})")
+
+if alertOn and (anyBear or anyBull)
+    direction = anyBear and anyBull ? "Bullish + Bearish" : anyBear ? "Bearish" : "Bullish"
+    // freq_once_per_bar fires on the first tick the divergence exists, which is the point
+    // of the indicator. once_per_bar_close would defer it to the close and lose signals
+    // that resolve mid-candle; freq_all would re-fire on every remaining tick.
+    alert("Recent SMT · " + syminfo.ticker + " — " + direction + " divergence just formed", alert.freq_once_per_bar)
