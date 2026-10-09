@@ -1,0 +1,202 @@
+//@version=6
+// =============================================================================
+// TRADING CHECKLIST
+// =============================================================================
+// README
+//
+// 1. Add the indicator
+//    Open the Pine Editor, paste this file, click "Add to chart". (Or save it
+//    first, then find it under Indicators > My scripts.)
+//
+// 2. Type your rules
+//    Open the indicator settings (gear icon or double-click the panel).
+//    "Rules" tab: type up to 10 rules. Tick the "Met" box beside a rule when
+//    the condition is satisfied. Rules left blank are hidden and not counted.
+//    Optional "Auto rules" group: rules that tick themselves (session window,
+//    close vs. EMA). They show above your manual rules, marked "(auto)".
+//
+// 3. Make your rules persist
+//    - Settings dialog > "Defaults" (bottom left) > "Save as default": the
+//      indicator loads with your rules every time you add it.
+//    - Or save the chart layout (cloud icon / Ctrl+S): rules and ticks are
+//      saved with that layout.
+//    - Or save an indicator template (Indicators > Templates > Save) to
+//      reapply the set on other charts.
+//
+// KNOWN LIMITATIONS
+//    - Pine tables are not clickable. Rules are ticked in the settings dialog,
+//      not on the chart.
+//    - Pine inputs have no placeholder text. The example ("e.g. Liquidity
+//      sweep occurred") is in each rule's tooltip instead.
+//    - Ticks are stored in the layout/template, not synced across devices
+//      unless the layout itself syncs to your TradingView account.
+//    - The session auto rule always uses America/New_York time and is meant for
+//      intraday charts.
+//    - With zero active rules the verdict shows "WAIT" (0/0 is not a setup).
+// =============================================================================
+indicator("Trading Checklist", overlay = true)
+
+// -----------------------------------------------------------------------------
+// Constants
+// -----------------------------------------------------------------------------
+const string G_RULES = "Rules"
+const string G_AUTO  = "Auto rules"
+const string G_STYLE = "Style"
+const string RULE_TIP = "Type a rule, e.g. Liquidity sweep occurred. Leave blank to hide this row. Tick \"Met\" when the condition is satisfied."
+const string SESSION_TZ = "America/New_York"
+const int    MAX_ROWS = 15 // header + 2 auto + 10 manual + score + verdict
+
+// -----------------------------------------------------------------------------
+// Manual rule inputs (input.* must be top level, so the 10 slots are explicit)
+// -----------------------------------------------------------------------------
+r1Text  = input.string("", "Rule 1",  inline = "r1",  group = G_RULES, tooltip = RULE_TIP)
+r1Met   = input.bool(false, "Met",    inline = "r1",  group = G_RULES)
+r2Text  = input.string("", "Rule 2",  inline = "r2",  group = G_RULES, tooltip = RULE_TIP)
+r2Met   = input.bool(false, "Met",    inline = "r2",  group = G_RULES)
+r3Text  = input.string("", "Rule 3",  inline = "r3",  group = G_RULES, tooltip = RULE_TIP)
+r3Met   = input.bool(false, "Met",    inline = "r3",  group = G_RULES)
+r4Text  = input.string("", "Rule 4",  inline = "r4",  group = G_RULES, tooltip = RULE_TIP)
+r4Met   = input.bool(false, "Met",    inline = "r4",  group = G_RULES)
+r5Text  = input.string("", "Rule 5",  inline = "r5",  group = G_RULES, tooltip = RULE_TIP)
+r5Met   = input.bool(false, "Met",    inline = "r5",  group = G_RULES)
+r6Text  = input.string("", "Rule 6",  inline = "r6",  group = G_RULES, tooltip = RULE_TIP)
+r6Met   = input.bool(false, "Met",    inline = "r6",  group = G_RULES)
+r7Text  = input.string("", "Rule 7",  inline = "r7",  group = G_RULES, tooltip = RULE_TIP)
+r7Met   = input.bool(false, "Met",    inline = "r7",  group = G_RULES)
+r8Text  = input.string("", "Rule 8",  inline = "r8",  group = G_RULES, tooltip = RULE_TIP)
+r8Met   = input.bool(false, "Met",    inline = "r8",  group = G_RULES)
+r9Text  = input.string("", "Rule 9",  inline = "r9",  group = G_RULES, tooltip = RULE_TIP)
+r9Met   = input.bool(false, "Met",    inline = "r9",  group = G_RULES)
+r10Text = input.string("", "Rule 10", inline = "r10", group = G_RULES, tooltip = RULE_TIP)
+r10Met  = input.bool(false, "Met",    inline = "r10", group = G_RULES)
+
+// -----------------------------------------------------------------------------
+// Auto rule inputs (all off by default)
+// -----------------------------------------------------------------------------
+autoSessOn    = input.bool(false, "Inside session", inline = "sess", group = G_AUTO)
+autoSessLabel = input.string("Inside session", "Label", inline = "sess", group = G_AUTO)
+autoSessWin   = input.session("0930-1130", "Session window (New York time)", group = G_AUTO)
+
+autoEmaOn    = input.bool(false, "Above/below EMA", inline = "ema", group = G_AUTO)
+autoEmaLabel = input.string("EMA bias", "Label", inline = "ema", group = G_AUTO)
+autoEmaLen   = input.int(50, "EMA length", minval = 1, inline = "emaCfg", group = G_AUTO)
+autoEmaDir   = input.string("Long", "Direction", options = ["Long", "Short"], inline = "emaCfg", group = G_AUTO)
+
+// -----------------------------------------------------------------------------
+// Style inputs
+// -----------------------------------------------------------------------------
+titleText   = input.string("TRADE CHECKLIST", "Title", group = G_STYLE)
+posIn       = input.string("Middle Right", "Position", options = ["Top Left", "Top Center", "Top Right", "Middle Left", "Middle Center", "Middle Right", "Bottom Left", "Bottom Center", "Bottom Right"], group = G_STYLE)
+sizeIn      = input.string("Small", "Text size", options = ["Tiny", "Small", "Normal", "Large"], group = G_STYLE)
+bgColorIn   = input.color(color.rgb(19, 23, 34), "Panel background", inline = "bg", group = G_STYLE)
+bgOpacity   = input.int(85, "Opacity %", minval = 0, maxval = 100, inline = "bg", group = G_STYLE)
+metColor    = input.color(color.rgb(38, 166, 154), "Met", inline = "col", group = G_STYLE)
+unmetColor  = input.color(color.rgb(239, 83, 80), "Unmet", inline = "col", group = G_STYLE)
+textColor   = input.color(color.white, "Text", inline = "col", group = G_STYLE)
+showVerdict = input.bool(true, "Show verdict line", group = G_STYLE)
+
+// -----------------------------------------------------------------------------
+// Derived settings
+// -----------------------------------------------------------------------------
+panelPos = switch posIn
+    "Top Left"      => position.top_left
+    "Top Center"    => position.top_center
+    "Top Right"     => position.top_right
+    "Middle Left"   => position.middle_left
+    "Middle Center" => position.middle_center
+    "Bottom Left"   => position.bottom_left
+    "Bottom Center" => position.bottom_center
+    "Bottom Right"  => position.bottom_right
+    => position.middle_right
+
+txtSize = switch sizeIn
+    "Tiny"   => size.tiny
+    "Normal" => size.normal
+    "Large"  => size.large
+    => size.small
+
+// input.color opacity is overridden by the explicit opacity input.
+panelBg = color.new(bgColorIn, 100 - bgOpacity)
+
+// -----------------------------------------------------------------------------
+// Auto rule conditions (computed every bar at top level; only the last bar is shown)
+// -----------------------------------------------------------------------------
+emaVal    = ta.ema(close, autoEmaLen)
+inSession = not na(time(timeframe.period, autoSessWin, SESSION_TZ))
+emaMet    = autoEmaDir == "Long" ? close > emaVal : close < emaVal
+
+// -----------------------------------------------------------------------------
+// Collect manual rules into arrays
+// -----------------------------------------------------------------------------
+var array<string> ruleTexts  = array.from(r1Text, r2Text, r3Text, r4Text, r5Text, r6Text, r7Text, r8Text, r9Text, r10Text)
+var array<bool>   ruleChecks = array.from(r1Met, r2Met, r3Met, r4Met, r5Met, r6Met, r7Met, r8Met, r9Met, r10Met)
+
+// A rule is active when its text has something other than spaces.
+isActive(string s) =>
+    str.length(str.replace_all(s, " ", "")) > 0
+
+// -----------------------------------------------------------------------------
+// Row layout (inputs are constant for a run, so this is fixed on bar 0)
+// -----------------------------------------------------------------------------
+var int activeManual = 0
+if barstate.isfirst
+    for t in ruleTexts
+        if isActive(t)
+            activeManual += 1
+
+autoCount  = (autoSessOn ? 1 : 0) + (autoEmaOn ? 1 : 0)
+scoreRow   = 1 + autoCount + activeManual
+verdictRow = scoreRow + 1
+
+// -----------------------------------------------------------------------------
+// Panel: create once, merge header/footer once, update cells on the last bar
+// -----------------------------------------------------------------------------
+var table panel = table.new(panelPos, 2, MAX_ROWS, bgcolor = panelBg, frame_color = color.new(textColor, 70), frame_width = 1, border_width = 0)
+
+if barstate.isfirst
+    table.cell(panel, 0, 0, titleText, text_color = textColor, text_size = txtSize, text_halign = text.align_center)
+    table.merge_cells(panel, 0, 0, 1, 0)
+    table.cell(panel, 0, scoreRow, "", text_color = textColor, text_size = txtSize, text_halign = text.align_center)
+    table.merge_cells(panel, 0, scoreRow, 1, scoreRow)
+    if showVerdict
+        table.cell(panel, 0, verdictRow, "", text_size = txtSize, text_halign = text.align_center)
+        table.merge_cells(panel, 0, verdictRow, 1, verdictRow)
+
+// Draws one rule row: status icon in column 0, rule text in column 1.
+drawRow(table t, int row, string label, bool met) =>
+    table.cell(t, 0, row, met ? "✔" : "✘", text_color = met ? metColor : unmetColor, text_size = txtSize, text_halign = text.align_center)
+    table.cell(t, 1, row, label, text_color = textColor, text_size = txtSize, text_halign = text.align_left)
+
+if barstate.islast
+    int row   = 1
+    int total = 0
+    int met   = 0
+
+    // Auto rules first
+    if autoSessOn
+        drawRow(panel, row, autoSessLabel + " (auto)", inSession)
+        row   += 1
+        total += 1
+        met   += inSession ? 1 : 0
+    if autoEmaOn
+        drawRow(panel, row, autoEmaLabel + " (auto)", emaMet)
+        row   += 1
+        total += 1
+        met   += emaMet ? 1 : 0
+
+    // Manual rules, skipping blank slots so the table has no gaps
+    for i = 0 to array.size(ruleTexts) - 1
+        string t = array.get(ruleTexts, i)
+        if isActive(t)
+            bool m = array.get(ruleChecks, i)
+            drawRow(panel, row, t, m)
+            row   += 1
+            total += 1
+            met   += m ? 1 : 0
+
+    // Footer
+    table.cell_set_text(panel, 0, scoreRow, str.tostring(met) + "/" + str.tostring(total) + " rules met")
+    if showVerdict
+        bool allMet = total > 0 and met == total
+        table.cell_set_text(panel, 0, verdictRow, allMet ? "A+ SETUP" : "WAIT")
+        table.cell_set_text_color(panel, 0, verdictRow, allMet ? metColor : unmetColor)
